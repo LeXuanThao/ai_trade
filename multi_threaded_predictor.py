@@ -174,29 +174,35 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
                 logging.warning(f"Could not set margin type to ISOLATED for {symbol}: {e}")
                 send_discord_message(f"⚠️ Warning: Could not set margin type to ISOLATED for {symbol}: {e}")
 
-        current_leverage = None # Initialize to None, so we know if it was successfully fetched
+        current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
         try:
-            # Use get_leverage() to get the current leverage setting for the symbol
-            leverage_info = binance_futures_client.get_leverage(symbol=symbol)
-            # The response is a list of dictionaries, find the one for the symbol
-            for entry in leverage_info:
+            position_risk = binance_futures_client.get_position_risk(symbol=symbol)
+            # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
+            found_leverage = False
+            for entry in position_risk:
                 if entry['symbol'] == symbol:
-                    current_leverage = int(entry['leverage'])
+                    current_leverage = float(entry['leverage'])
+                    found_leverage = True
                     break
-            if current_leverage is None:
-                logging.warning(f"Could not find current leverage for {symbol} in get_leverage() response. Assuming 1x.")
-                current_leverage = 1 # Fallback if symbol not found in response
+            if not found_leverage: # If symbol not found in position_risk, assume 1x
+                logging.info(f"No active position found for {symbol}. Assuming current leverage is 1x.")
         except BinanceAPIException as e:
-            logging.warning(f"Could not get current leverage for {symbol} using get_leverage(): {e}. Assuming 1x.")
-            send_discord_message(f"⚠️ Warning: Could not get current leverage for {symbol}: {e}. Assuming 1x leverage.")
-            current_leverage = 1 # Fallback if API call fails
+            # Handle cases where get_position_risk might fail for other reasons
+            logging.warning(f"Could not get position risk for {symbol}: {e}. Assuming current leverage is 1x.")
+            send_discord_message(f"⚠️ Warning: Could not get position risk for {symbol}: {e}. Assuming 1x leverage.")
+            current_leverage = 1.0 # Fallback to 1x if API call fails
 
-        if desired_leverage != current_leverage:
+        try:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
-            logging.info(f"Set leverage to {desired_leverage}x for {symbol} (was {current_leverage}x)")
-            send_discord_message(f"ℹ️ Set leverage to {desired_leverage}x for {symbol} (was {current_leverage}x)")
-        else:
-            logging.info(f"Leverage for {symbol} is already {desired_leverage}x. No change needed.")
+            logging.info(f"Set leverage to {desired_leverage}x for {symbol}")
+            send_discord_message(f"ℹ️ Set leverage to {desired_leverage}x for {symbol}")
+        except BinanceAPIException as e:
+            # Error code -4028 means "Leverage is already set to the desired value."
+            if e.code == -4028:
+                logging.info(f"Leverage for {symbol} is already {desired_leverage}x. No change needed.")
+            else:
+                logging.warning(f"Could not set leverage for {symbol}: {e}")
+                send_discord_message(f"⚠️ Warning: Could not set leverage for {symbol}: {e}")
         
         return desired_leverage
 
