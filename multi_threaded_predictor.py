@@ -165,6 +165,14 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
         # Also ensure it's at least 1x
         desired_leverage = int(max(1, min(max_allowed_leverage, MAX_LEVERAGE_CAP, required_leverage_for_min_notional)))
 
+        # Ensure margin type is ISOLATED for the symbol
+        try:
+            binance_futures_client.change_margin_type(symbol=symbol, marginType='ISOLATED')
+            logging.info(f"Set margin type to ISOLATED for {symbol}")
+        except BinanceAPIException as e:
+            logging.warning(f"Could not set margin type to ISOLATED for {symbol}: {e}")
+            send_discord_message(f"⚠️ Warning: Could not set margin type to ISOLATED for {symbol}: {e}")
+
         current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
         try:
             position_risk = binance_futures_client.get_position_risk(symbol=symbol)
