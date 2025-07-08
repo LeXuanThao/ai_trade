@@ -27,6 +27,9 @@ FIXED_STOP_LOSS_PERCENT = 0.03 # 3% fixed stop loss
 # --- New Leverage & Margin Parameters ---
 MAX_LEVERAGE_CAP = 20 # Max leverage bot will use, even if Binance allows more
 FIXED_MARGIN_PER_TRADE_USD = 1.0 # Fixed $1 margin per trade as requested
+# Note: With $1 margin and leverage, the notional value will be: $1 * leverage
+# Example: $1 margin * 5x leverage = $5 notional value
+# The actual position size will be: notional_value / current_price
 INVESTMENT_LIMIT_PERCENT = 0.20 # Stop taking new orders if total invested capital reaches 20% of initial capital
 
 # --- Market Regime Parameters (for simulation) ---
@@ -153,35 +156,48 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
     try:
         MIN_NOTIONAL_VALUE = 5.0 # Binance minimum notional value
         
-        # Calculate required leverage to achieve MIN_NOTIONAL_VALUE with FIXED_MARGIN_PER_TRADE_USD
-        # notional_value = margin * leverage
-        # leverage = notional_value / margin
-        required_leverage_for_min_notional = MIN_NOTIONAL_VALUE / FIXED_MARGIN_PER_TRADE_USD
-
         # Get max allowed leverage for the symbol from exchange_info
         max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
         
-        # Determine desired leverage: min(max_allowed, MAX_LEVERAGE_CAP, required_for_min_notional)
-        # Also ensure it's at least 1x
-        desired_leverage = int(max(1, min(max_allowed_leverage, MAX_LEVERAGE_CAP, required_leverage_for_min_notional)))
+        # Calculate the minimum leverage needed to meet Binance's minimum notional requirement
+        # with our fixed $1 margin: notional_value = margin * leverage
+        # So: leverage = notional_value / margin
+        min_leverage_for_notional = MIN_NOTIONAL_VALUE / FIXED_MARGIN_PER_TRADE_USD  # 5.0 / 1.0 = 5x
+        
+        # Use the maximum available leverage (up to our cap) to maximize position size
+        # while still using only $1 margin per trade
+        desired_leverage = int(min(max_allowed_leverage, MAX_LEVERAGE_CAP))
+        
+        # Ensure it meets the minimum requirement for Binance notional value
+        if desired_leverage < min_leverage_for_notional:
+            desired_leverage = int(min_leverage_for_notional)
+        
+        # Log the calculation for verification
+        potential_notional = FIXED_MARGIN_PER_TRADE_USD * desired_leverage
+        logging.info(f"Leverage calculation for {symbol}: margin=${FIXED_MARGIN_PER_TRADE_USD}, "
+                    f"leverage={desired_leverage}x, potential_notional=${potential_notional:.2f}, "
+                    f"min_required=${MIN_NOTIONAL_VALUE}, max_allowed={max_allowed_leverage}x")
 
         # Ensure margin type is ISOLATED for the symbol
         try:
             binance_futures_client.change_margin_type(symbol=symbol, marginType='ISOLATED')
             logging.info(f"Set margin type to ISOLATED for {symbol}")
         except BinanceAPIException as e:
-            if e.code != -4046: # Ignore "No need to change margin type." error
+            if e.code == -4046: # "No need to change margin type." - already isolated
+                logging.info(f"Margin type for {symbol} is already ISOLATED. No change needed.")
+            else:
                 logging.warning(f"Could not set margin type to ISOLATED for {symbol}: {e}")
                 send_discord_message(f"⚠️ Warning: Could not set margin type to ISOLATED for {symbol}: {e}")
+                # Don't treat this as a critical error, continue with leverage setting
 
-        current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
+        # Note: We fetch current leverage for logging purposes but don't need it for the logic
         try:
             position_risk = binance_futures_client.get_position_risk(symbol=symbol)
             # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
             found_leverage = False
             for entry in position_risk:
                 if entry['symbol'] == symbol:
-                    current_leverage = float(entry['leverage'])
+                    logging.info(f"Current leverage for {symbol}: {entry['leverage']}x")
                     found_leverage = True
                     break
             if not found_leverage: # If symbol not found in position_risk, assume 1x
@@ -190,7 +206,6 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
             # Handle cases where get_position_risk might fail for other reasons
             logging.warning(f"Could not get position risk for {symbol}: {e}. Assuming current leverage is 1x.")
             send_discord_message(f"⚠️ Warning: Could not get position risk for {symbol}: {e}. Assuming 1x leverage.")
-            current_leverage = 1.0 # Fallback to 1x if API call fails
 
         try:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
@@ -206,6 +221,23 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
         
         return desired_leverage
 
+    except BinanceAPIException as e:
+        # Handle Binance-specific API errors
+        if e.code == -4046: # "No need to change margin type."
+            logging.info(f"Margin type for {symbol} is already set correctly.")
+            # Try to get current leverage and return it, or return a default
+            try:
+                position_risk = binance_futures_client.get_position_risk(symbol=symbol)
+                for entry in position_risk:
+                    if entry['symbol'] == symbol:
+                        return float(entry['leverage'])
+                return MAX_LEVERAGE_CAP # Default if no position found
+            except Exception:
+                return MAX_LEVERAGE_CAP # Fallback
+        else:
+            logging.error(f"Binance API error calculating and setting leverage for {symbol}: {e}")
+            send_discord_message(f"🚨 CRITICAL ERROR: Could not set leverage for {symbol}: {e}")
+            return None # Indicate failure
     except Exception as e:
         logging.error(f"Error calculating and setting leverage for {symbol}: {e}")
         send_discord_message(f"🚨 CRITICAL ERROR: Could not set leverage for {symbol}: {e}")
@@ -357,12 +389,11 @@ def main():
                     # Check if total invested capital exceeds the limit
                     if total_invested_capital >= INITIAL_CAPITAL * INVESTMENT_LIMIT_PERCENT:
                         logging.info(f"Total invested capital ({total_invested_capital:.2f}) reached {INVESTMENT_LIMIT_PERCENT*100:.0f}% of initial capital. Skipping new orders.")
-                        send_discord_message(f"⚠️ Total invested capital reached limit. Skipping new orders.")
+                        send_discord_message("⚠️ Total invested capital reached limit. Skipping new orders.")
                         continue # Skip placing new orders
 
                     # Calculate max margin amount for this trade
                     # In a real bot, you'd fetch actual account balance from Binance to get current capital
-                    current_account_balance = capital # Using simulated capital for now
                     max_margin_amount = FIXED_MARGIN_PER_TRADE_USD # Use fixed $1 margin
                     
                     # NEW: Calculate and set leverage before placing order
@@ -371,11 +402,16 @@ def main():
                         logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
                         continue
                     
-
+                    # Calculate notional value with the set leverage
                     notional_value_allowed = max_margin_amount * calculated_leverage
 
                     # Calculate quantity to buy
                     quantity_to_buy = notional_value_allowed / current_price
+                    
+                    # Log trade calculation for verification
+                    logging.info(f"Trade calculation for {symbol}: margin=${max_margin_amount:.2f}, "
+                                f"leverage={calculated_leverage}x, notional=${notional_value_allowed:.2f}, "
+                                f"price=${current_price:.2f}, quantity={quantity_to_buy:.6f}")
                     
                     # Quantity precision and min_qty handled in place_order function
 
@@ -416,7 +452,7 @@ def main():
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt received. Stopping workers...")
         manager.stop_workers() 
-        send_discord_message(f"🛑 Trading bot stopped!")
+        send_discord_message("🛑 Trading bot stopped!")
         logging.info("Main thread exiting.")
     except Exception as e:
         logging.error(f"Critical error in main loop: {e}")
