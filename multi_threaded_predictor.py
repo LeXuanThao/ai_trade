@@ -34,7 +34,7 @@ BOLLINGER_PERIOD = 20 # Not directly used in simulation, but for context
 BOLLINGER_STD_DEV = 2 # Not directly used in simulation, but for context
 
 # --- Discord Webhook (Replace with your actual webhook URL) ---
-DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # --- Binance API Keys (Load from environment variables for security) ---
 API_KEY = os.getenv("BINANCE_API_KEY")
