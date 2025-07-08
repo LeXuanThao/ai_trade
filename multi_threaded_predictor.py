@@ -34,7 +34,7 @@ BOLLINGER_PERIOD = 20 # Not directly used in simulation, but for context
 BOLLINGER_STD_DEV = 2 # Not directly used in simulation, but for context
 
 # --- Discord Webhook (Replace with your actual webhook URL) ---
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"
 
 # --- Binance API Keys (Load from environment variables for security) ---
 API_KEY = os.getenv("BINANCE_API_KEY")
@@ -232,10 +232,20 @@ def main():
         for s in exchange_info['symbols']:
             if s['symbol'] in SYMBOLS:
                 # Store minQty, stepSize, and max_leverage for precision handling
+                max_leverage_found = 0.0
+                # Iterate through filters to find maxLeverage
+                for f in s['filters']:
+                    if 'maxLeverage' in f:
+                        max_leverage_found = float(f['maxLeverage'])
+                        break
+                # Fallback if not found in filters (less common but possible)
+                if max_leverage_found == 0.0 and 'maxLeverage' in s:
+                    max_leverage_found = float(s['maxLeverage'])
+
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
                     'step_size': float(s['filters'][1]['stepSize']),
-                    'max_leverage_allowed': float(s['maxLeverage']) # Corrected access to maxLeverage
+                    'max_leverage_allowed': max_leverage_found
                 }
                 # Calculate and set leverage for each symbol
                 # This part is removed from startup and moved to entry logic
@@ -283,7 +293,22 @@ def main():
                     # Take Profit
                     take_profit_price = pos_data['entry_price'] * (1 + TAKE_PROFIT_PERCENT)
 
-                    # Check for exit conditions
+                    # NEW: Exit if ML signal is 0 or trend filter is not met
+                    is_trending_now = data['ma_fast'] > data['ma_slow']
+                    if signal == 0 or not is_trending_now: # If ML says no buy or trend is broken
+                        logging.info(f"ML signal or trend filter changed for {symbol}. Closing position.")
+                        # Place SELL order to close position
+                        quantity_to_sell = pos_data['current_position_size'] 
+                        order_result = place_order(symbol, 'SELL', 'MARKET', quantity_to_sell)
+                        
+                        if order_result: # If order was successfully placed
+                            logging.info(f"CLOSED LONG {symbol} at {current_price}")
+                            send_discord_message(f"📉 CLOSED LONG {symbol} at ${current_price:,.2f} (ML/Trend Exit)")
+                            # Reset position data
+                            pos_data['position'], pos_data['entry_price'], pos_data['trailing_stop_price'], pos_data['fixed_stop_loss_price'], pos_data['current_position_size'] = 0, 0, 0, 0, 0
+                        continue # Skip other exit checks if already closed
+
+                    # Check for other exit conditions (trailing stop, fixed stop, take profit)
                     if current_price <= pos_data['trailing_stop_price'] or \
                        current_price <= pos_data['fixed_stop_loss_price'] or \
                        current_price >= take_profit_price:
@@ -296,7 +321,7 @@ def main():
                             # In a real bot, you'd verify order execution and update PnL from Binance
                             # For simulation, we'll just reset position data
                             logging.info(f"CLOSED LONG {symbol} at {current_price}")
-                            send_discord_message(f"📉 CLOSED LONG {symbol} at ${current_price:,.2f}")
+                            send_discord_message(f"📉 CLOSED LONG {symbol} at ${current_price:,.2f} (RM Exit)")
                             # Reset position data
                             pos_data['position'], pos_data['entry_price'], pos_data['trailing_stop_price'], pos_data['fixed_stop_loss_price'], pos_data['current_position_size'] = 0, 0, 0, 0, 0
 
@@ -313,8 +338,6 @@ def main():
                         logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
                         continue
                     symbol_info[symbol]['current_set_leverage'] = calculated_leverage # Store the set leverage
-
-                    notional_value_allowed = max_margin_amount * calculated_leverage
 
                     notional_value_allowed = max_margin_amount * calculated_leverage
 
