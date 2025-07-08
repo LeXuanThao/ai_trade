@@ -52,6 +52,9 @@ binance_futures_client = UMFutures(key=API_KEY, secret=API_SECRET, base_url="htt
 # --- Global variable to store symbol info (minQty, stepSize, max_leverage, current_set_leverage) ---
 symbol_info = {}
 
+# --- Global variable to track leverage status for each symbol ---
+leverage_initialized = {}
+
 # --- Hàng đợi để các luồng con gửi kết quả về luồng chính ---
 prediction_queue = queue.Queue()
 
@@ -172,52 +175,56 @@ def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
         if desired_leverage < min_leverage_for_notional:
             desired_leverage = int(min_leverage_for_notional)
         
+        # Check if leverage is already set correctly for this symbol
+        if symbol in symbol_info and 'current_set_leverage' in symbol_info[symbol]:
+            current_leverage = symbol_info[symbol]['current_set_leverage']
+            if current_leverage == desired_leverage:
+                logging.info(f"Leverage for {symbol} already set to {desired_leverage}x. No API call needed.")
+                return desired_leverage
+        
         # Log the calculation for verification
         potential_notional = FIXED_MARGIN_PER_TRADE_USD * desired_leverage
-        logging.info(f"Leverage calculation for {symbol}: margin=${FIXED_MARGIN_PER_TRADE_USD}, "
+        logging.info(f"Setting leverage for {symbol}: margin=${FIXED_MARGIN_PER_TRADE_USD}, "
                     f"leverage={desired_leverage}x, potential_notional=${potential_notional:.2f}, "
                     f"min_required=${MIN_NOTIONAL_VALUE}, max_allowed={max_allowed_leverage}x")
 
-        # Ensure margin type is ISOLATED for the symbol
-        try:
-            binance_futures_client.change_margin_type(symbol=symbol, marginType='ISOLATED')
-            logging.info(f"Set margin type to ISOLATED for {symbol}")
-        except BinanceAPIException as e:
-            if e.code == -4046: # "No need to change margin type." - already isolated
-                logging.info(f"Margin type for {symbol} is already ISOLATED. No change needed.")
-            else:
-                logging.warning(f"Could not set margin type to ISOLATED for {symbol}: {e}")
-                send_discord_message(f"⚠️ Warning: Could not set margin type to ISOLATED for {symbol}: {e}")
-                # Don't treat this as a critical error, continue with leverage setting
+        # Only set margin type to ISOLATED if not already done for this symbol
+        if symbol not in leverage_initialized or not leverage_initialized[symbol].get('margin_type_set', False):
+            try:
+                binance_futures_client.change_margin_type(symbol=symbol, marginType='ISOLATED')
+                logging.info(f"Set margin type to ISOLATED for {symbol}")
+                # Mark that margin type has been set
+                if symbol not in leverage_initialized:
+                    leverage_initialized[symbol] = {}
+                leverage_initialized[symbol]['margin_type_set'] = True
+            except BinanceAPIException as e:
+                if e.code == -4046: # "No need to change margin type." - already isolated
+                    logging.info(f"Margin type for {symbol} is already ISOLATED. No change needed.")
+                    if symbol not in leverage_initialized:
+                        leverage_initialized[symbol] = {}
+                    leverage_initialized[symbol]['margin_type_set'] = True
+                else:
+                    logging.warning(f"Could not set margin type to ISOLATED for {symbol}: {e}")
+                    send_discord_message(f"⚠️ Warning: Could not set margin type to ISOLATED for {symbol}: {e}")
+                    # Don't treat this as a critical error, continue with leverage setting
 
-        # Note: We fetch current leverage for logging purposes but don't need it for the logic
-        try:
-            position_risk = binance_futures_client.get_position_risk(symbol=symbol)
-            # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
-            found_leverage = False
-            for entry in position_risk:
-                if entry['symbol'] == symbol:
-                    logging.info(f"Current leverage for {symbol}: {entry['leverage']}x")
-                    found_leverage = True
-                    break
-            if not found_leverage: # If symbol not found in position_risk, assume 1x
-                logging.info(f"No active position found for {symbol}. Assuming current leverage is 1x.")
-        except BinanceAPIException as e:
-            # Handle cases where get_position_risk might fail for other reasons
-            logging.warning(f"Could not get position risk for {symbol}: {e}. Assuming current leverage is 1x.")
-            send_discord_message(f"⚠️ Warning: Could not get position risk for {symbol}: {e}. Assuming 1x leverage.")
-
+        # Set leverage only if it's different from what we think is currently set
         try:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
-            logging.info(f"Set leverage to {desired_leverage}x for {symbol}")
+            logging.info(f"✅ Set leverage to {desired_leverage}x for {symbol}")
             send_discord_message(f"ℹ️ Set leverage to {desired_leverage}x for {symbol}")
+            # Update our tracking
+            symbol_info[symbol]['current_set_leverage'] = desired_leverage
         except BinanceAPIException as e:
             # Error code -4028 means "Leverage is already set to the desired value."
             if e.code == -4028:
                 logging.info(f"Leverage for {symbol} is already {desired_leverage}x. No change needed.")
+                # Update our tracking even if no change was made
+                symbol_info[symbol]['current_set_leverage'] = desired_leverage
             else:
                 logging.warning(f"Could not set leverage for {symbol}: {e}")
                 send_discord_message(f"⚠️ Warning: Could not set leverage for {symbol}: {e}")
+                # Don't update tracking if setting failed
         
         return desired_leverage
 
@@ -279,6 +286,66 @@ def place_order(symbol, side, order_type, quantity, price=None):
         send_discord_message(f"❌ Error placing order for {symbol}: {e}")
         return None
 
+# --- Hàm khởi tạo thiết lập đòn bẩy cho tất cả các cặp (gọi một lần khi khởi động) ---
+def initialize_leverage_for_all_symbols(binance_futures_client):
+    """Initialize leverage settings for all symbols once at startup"""
+    logging.info("Initializing leverage settings for all symbols...")
+    
+    for symbol in SYMBOLS:
+        try:
+            # Calculate optimal leverage for this symbol
+            if symbol not in symbol_info:
+                logging.warning(f"Symbol {symbol} not found in symbol_info. Skipping leverage initialization.")
+                continue
+                
+            MIN_NOTIONAL_VALUE = 5.0
+            max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
+            min_leverage_for_notional = MIN_NOTIONAL_VALUE / FIXED_MARGIN_PER_TRADE_USD
+            desired_leverage = int(min(max_allowed_leverage, MAX_LEVERAGE_CAP))
+            
+            if desired_leverage < min_leverage_for_notional:
+                desired_leverage = int(min_leverage_for_notional)
+            
+            # Set margin type to ISOLATED
+            try:
+                binance_futures_client.change_margin_type(symbol=symbol, marginType='ISOLATED')
+                logging.info(f"✅ Set margin type to ISOLATED for {symbol}")
+            except BinanceAPIException as e:
+                if e.code == -4046:
+                    logging.info(f"✅ Margin type for {symbol} already ISOLATED")
+                else:
+                    logging.warning(f"⚠️ Could not set margin type for {symbol}: {e}")
+            
+            # Set leverage
+            try:
+                binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
+                logging.info(f"✅ Set leverage to {desired_leverage}x for {symbol}")
+                symbol_info[symbol]['current_set_leverage'] = desired_leverage
+            except BinanceAPIException as e:
+                if e.code == -4028:
+                    logging.info(f"✅ Leverage for {symbol} already {desired_leverage}x")
+                    symbol_info[symbol]['current_set_leverage'] = desired_leverage
+                else:
+                    logging.warning(f"⚠️ Could not set leverage for {symbol}: {e}")
+                    
+        except Exception as e:
+            logging.error(f"Error initializing leverage for {symbol}: {e}")
+    
+    logging.info("✅ Leverage initialization complete for all symbols")
+
+# --- Function to get leverage without setting it (used during trading) ---
+def get_leverage_for_symbol(symbol):
+    """Get the leverage for a symbol without making API calls"""
+    if symbol not in symbol_info or symbol_info[symbol]['current_set_leverage'] is None:
+        logging.warning(f"Leverage not initialized for {symbol}. Using fallback calculation.")
+        # Fallback calculation
+        MIN_NOTIONAL_VALUE = 5.0
+        max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
+        min_leverage_for_notional = MIN_NOTIONAL_VALUE / FIXED_MARGIN_PER_TRADE_USD
+        return int(min(max_allowed_leverage, MAX_LEVERAGE_CAP, max(1, min_leverage_for_notional)))
+    
+    return symbol_info[symbol]['current_set_leverage']
+
 # --- Luồng chính ---
 def main():
     logging.info("Main thread started.")
@@ -304,12 +371,16 @@ def main():
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
                     'step_size': float(s['filters'][1]['stepSize']),
-                    'max_leverage_allowed': max_leverage_found
+                    'max_leverage_allowed': max_leverage_found,
+                    'current_set_leverage': None  # Will be set when leverage is first configured
                 }
     except Exception as e:
         logging.error(f"Error fetching exchange info or setting leverage: {e}")
         send_discord_message(f"🚨 CRITICAL ERROR: Could not fetch exchange info or set leverage: {e}")
         return # Exit if critical setup fails
+
+    # --- Initialize leverage settings for all symbols once ---
+    initialize_leverage_for_all_symbols(binance_futures_client)
 
     # --- Khởi tạo trạng thái giao dịch ---
     capital = INITIAL_CAPITAL # This will be updated by actual PnL from Binance
@@ -379,7 +450,7 @@ def main():
                             logging.info(f"CLOSED LONG {symbol} at {current_price}")
                             send_discord_message(f"📉 CLOSED LONG {symbol} at ${current_price:,.2f} (RM Exit)")
                             # Reset position data
-                            pos_data['position'], pos_data['entry_price'], pos_data['trailing_stop_price'], pos_data['fixed_stop_loss_price'], pos_data['current_position_size'] = 0, 0, 0, 0, 0
+                            pos_data['position'], pos_data['entry_price'], pos_data['trailing_stop_loss_price'], pos_data['fixed_stop_loss_price'], pos_data['current_position_size'] = 0, 0, 0, 0, 0
 
                 # --- ENTRY LOGIC (Based on Market Regime and ML Signal) ---
                 if pos_data['position'] == 0: # If no open position
@@ -396,11 +467,8 @@ def main():
                     # In a real bot, you'd fetch actual account balance from Binance to get current capital
                     max_margin_amount = FIXED_MARGIN_PER_TRADE_USD # Use fixed $1 margin
                     
-                    # NEW: Calculate and set leverage before placing order
-                    calculated_leverage = calculate_and_set_leverage(symbol, binance_futures_client, current_price)
-                    if calculated_leverage is None: # If setting leverage failed, skip trade
-                        logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
-                        continue
+                    # Get leverage for this symbol (already set at startup, no API calls needed)
+                    calculated_leverage = get_leverage_for_symbol(symbol)
                     
                     # Calculate notional value with the set leverage
                     notional_value_allowed = max_margin_amount * calculated_leverage
