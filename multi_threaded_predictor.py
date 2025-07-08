@@ -25,6 +25,7 @@ TAKE_PROFIT_PERCENT = 0.10    # 10% take profit
 FIXED_STOP_LOSS_PERCENT = 0.03 # 3% fixed stop loss
 
 # --- New Leverage & Margin Parameters ---
+MAX_LEVERAGE_CAP = 20 # Max leverage bot will use, even if Binance allows more
 FIXED_MARGIN_PER_TRADE_USD = 1.0 # Fixed $1 margin per trade as requested
 INVESTMENT_LIMIT_PERCENT = 0.20 # Stop taking new orders if total invested capital reaches 20% of initial capital
 
@@ -148,9 +149,21 @@ class ThreadPoolManager:
         logging.info("All workers stopped.")
 
 # --- Hàm tính toán và đặt đòn bẩy (MỚI) ---
-def calculate_and_set_leverage(symbol, binance_futures_client):
+def calculate_and_set_leverage(symbol, binance_futures_client, current_price):
     try:
-        desired_leverage = 1 # Always set leverage to 1x for fixed $1 margin
+        MIN_NOTIONAL_VALUE = 5.0 # Binance minimum notional value
+        
+        # Calculate required leverage to achieve MIN_NOTIONAL_VALUE with FIXED_MARGIN_PER_TRADE_USD
+        # notional_value = margin * leverage
+        # leverage = notional_value / margin
+        required_leverage_for_min_notional = MIN_NOTIONAL_VALUE / FIXED_MARGIN_PER_TRADE_USD
+
+        # Get max allowed leverage for the symbol from exchange_info
+        max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
+        
+        # Determine desired leverage: min(max_allowed, MAX_LEVERAGE_CAP, required_for_min_notional)
+        # Also ensure it's at least 1x
+        desired_leverage = int(max(1, min(max_allowed_leverage, MAX_LEVERAGE_CAP, required_leverage_for_min_notional)))
 
         current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
         try:
@@ -230,9 +243,20 @@ def main():
                 # Store minQty, stepSize, and max_leverage for precision handling
                 
 
+                max_leverage_found = 0.0
+                # Iterate through filters to find maxLeverage
+                for f in s['filters']:
+                    if 'maxLeverage' in f:
+                        max_leverage_found = float(f['maxLeverage'])
+                        break
+                # Fallback if not found in filters (less common but possible)
+                if max_leverage_found == 0.0 and 'maxLeverage' in s:
+                    max_leverage_found = float(s['maxLeverage'])
+
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
-                    'step_size': float(s['filters'][1]['stepSize'])
+                    'step_size': float(s['filters'][1]['stepSize']),
+                    'max_leverage_allowed': max_leverage_found
                 }
     except Exception as e:
         logging.error(f"Error fetching exchange info or setting leverage: {e}")
@@ -326,7 +350,7 @@ def main():
                     max_margin_amount = FIXED_MARGIN_PER_TRADE_USD # Use fixed $1 margin
                     
                     # NEW: Calculate and set leverage before placing order
-                    calculated_leverage = calculate_and_set_leverage(symbol, binance_futures_client)
+                    calculated_leverage = calculate_and_set_leverage(symbol, binance_futures_client, current_price)
                     if calculated_leverage is None: # If setting leverage failed, skip trade
                         logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
                         continue
