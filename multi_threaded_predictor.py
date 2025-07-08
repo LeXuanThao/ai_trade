@@ -25,8 +25,8 @@ TAKE_PROFIT_PERCENT = 0.10    # 10% take profit
 FIXED_STOP_LOSS_PERCENT = 0.03 # 3% fixed stop loss
 
 # --- New Leverage & Margin Parameters ---
-MAX_LEVERAGE_CAP = 20 # Max leverage bot will use, even if Binance allows more
 FIXED_MARGIN_PER_TRADE_USD = 1.0 # Fixed $1 margin per trade as requested
+INVESTMENT_LIMIT_PERCENT = 0.20 # Stop taking new orders if total invested capital reaches 20% of initial capital
 
 # --- Market Regime Parameters (for simulation) ---
 ADX_THRESHOLD = 25 
@@ -150,32 +150,23 @@ class ThreadPoolManager:
 # --- Hàm tính toán và đặt đòn bẩy (MỚI) ---
 def calculate_and_set_leverage(symbol, binance_futures_client):
     try:
-        # 1. Get max allowed leverage for the symbol from exchange_info
-        # This info is already stored in symbol_info during initial exchange_info fetch
-        max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
-        
-        # 2. Determine desired leverage (cap it at MAX_LEVERAGE_CAP)
-        desired_leverage = int(min(max_allowed_leverage, MAX_LEVERAGE_CAP))
+        desired_leverage = 1 # Always set leverage to 1x for fixed $1 margin
 
-        # 3. Get current leverage setting for the symbol
-        # Use get_position_risk for current leverage per symbol
         current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
         try:
             position_risk = binance_futures_client.get_position_risk(symbol=symbol)
-            # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
             found_leverage = False
             for entry in position_risk:
                 if entry['symbol'] == symbol:
                     current_leverage = float(entry['leverage'])
                     found_leverage = True
                     break
-            if not found_leverage: # If symbol not found in position_risk, assume 1x
+            if not found_leverage:
                 logging.info(f"No active position found for {symbol}. Assuming current leverage is 1x.")
         except BinanceAPIException as e:
-            # Handle cases where get_position_risk might fail for other reasons
             logging.warning(f"Could not get position risk for {symbol}: {e}. Assuming current leverage is 1x.")
             send_discord_message(f"⚠️ Warning: Could not get position risk for {symbol}: {e}. Assuming 1x leverage.")
-            current_leverage = 1.0 # Fallback to 1x if API call fails
+            current_leverage = 1.0
 
         if desired_leverage != current_leverage:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
@@ -237,24 +228,12 @@ def main():
         for s in exchange_info['symbols']:
             if s['symbol'] in SYMBOLS:
                 # Store minQty, stepSize, and max_leverage for precision handling
-                max_leverage_found = 0.0
-                # Iterate through filters to find maxLeverage
-                for f in s['filters']:
-                    if 'maxLeverage' in f:
-                        max_leverage_found = float(f['maxLeverage'])
-                        break
-                # Fallback if not found in filters (less common but possible)
-                if max_leverage_found == 0.0 and 'maxLeverage' in s:
-                    max_leverage_found = float(s['maxLeverage'])
+                
 
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
-                    'step_size': float(s['filters'][1]['stepSize']),
-                    'max_leverage_allowed': max_leverage_found
+                    'step_size': float(s['filters'][1]['stepSize'])
                 }
-                # Calculate and set leverage for each symbol
-                # This part is removed from startup and moved to entry logic
-                symbol_info[s['symbol']]['current_set_leverage'] = 0 # Initialize to 0 or None
     except Exception as e:
         logging.error(f"Error fetching exchange info or setting leverage: {e}")
         send_discord_message(f"🚨 CRITICAL ERROR: Could not fetch exchange info or set leverage: {e}")
@@ -332,6 +311,15 @@ def main():
 
                 # --- ENTRY LOGIC (Based on Market Regime and ML Signal) ---
                 if pos_data['position'] == 0: # If no open position
+                    # Calculate total invested capital across all symbols
+                    total_invested_capital = sum(p['current_position_size'] * p['entry_price'] for p in positions.values() if p['position'] == 1)
+                    
+                    # Check if total invested capital exceeds the limit
+                    if total_invested_capital >= INITIAL_CAPITAL * INVESTMENT_LIMIT_PERCENT:
+                        logging.info(f"Total invested capital ({total_invested_capital:.2f}) reached {INVESTMENT_LIMIT_PERCENT*100:.0f}% of initial capital. Skipping new orders.")
+                        send_discord_message(f"⚠️ Total invested capital reached limit. Skipping new orders.")
+                        continue # Skip placing new orders
+
                     # Calculate max margin amount for this trade
                     # In a real bot, you'd fetch actual account balance from Binance to get current capital
                     current_account_balance = capital # Using simulated capital for now
@@ -342,7 +330,7 @@ def main():
                     if calculated_leverage is None: # If setting leverage failed, skip trade
                         logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
                         continue
-                    symbol_info[symbol]['current_set_leverage'] = calculated_leverage # Store the set leverage
+                    
 
                     notional_value_allowed = max_margin_amount * calculated_leverage
 
