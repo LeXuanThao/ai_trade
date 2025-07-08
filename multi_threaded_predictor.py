@@ -34,7 +34,7 @@ BOLLINGER_PERIOD = 20 # Not directly used in simulation, but for context
 BOLLINGER_STD_DEV = 2 # Not directly used in simulation, but for context
 
 # --- Discord Webhook (Replace with your actual webhook URL) ---
-DISCORD_WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # --- Binance API Keys (Load from environment variables for security) ---
 API_KEY = os.getenv("BINANCE_API_KEY")
@@ -235,7 +235,7 @@ def main():
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
                     'step_size': float(s['filters'][1]['stepSize']),
-                    'max_leverage_allowed': float(s['filters'][0]['maxLeverage']) # Corrected access to maxLeverage
+                    'max_leverage_allowed': float(s['maxLeverage']) # Corrected access to maxLeverage
                 }
                 # Calculate and set leverage for each symbol
                 # This part is removed from startup and moved to entry logic
