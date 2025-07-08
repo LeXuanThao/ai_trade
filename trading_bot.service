@@ -1,0 +1,18 @@
+[Unit]
+Description=My Trading Bot Service
+After=network.target
+
+[Service]
+User=your_user                                  
+WorkingDirectory=/home/your_user/my_trading_bot
+ExecStart=/usr/bin/python3 multi_threaded_predictor.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/my_trading_bot/stdout.log
+StandardError=append:/var/log/my_trading_bot/stderr.log
+Environment="BINANCE_API_KEY=YOUR_API_KEY"
+Environment="BINANCE_API_SECRET=YOUR_API_SECRET"
+Environment="DISCORD_WEBHOOK_URL=YOUR_DISCORD_WEBHOOK_URL_HERE"
+
+[Install]
+WantedBy=multi-user.target
