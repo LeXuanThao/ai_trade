@@ -14,7 +14,7 @@ import os # For environment variables
 # --- Cấu hình Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
-# --- Cấu hình --- 
+# --- Cấu hình ---
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 PREDICTION_INTERVAL_SECONDS = 60 # Tần suất dự đoán cho mỗi cặp (ví dụ: mỗi phút)
 
@@ -159,18 +159,23 @@ def calculate_and_set_leverage(symbol, binance_futures_client):
 
         # 3. Get current leverage setting for the symbol
         # Use get_position_risk for current leverage per symbol
-        position_risk = binance_futures_client.get_position_risk(symbol=symbol)
-        # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
-        current_leverage = None
-        for entry in position_risk:
-            if entry['symbol'] == symbol:
-                current_leverage = float(entry['leverage'])
-                break
-        
-        if current_leverage is None: # Should not happen if symbol is valid
-            logging.error(f"Could not find current leverage for {symbol} in position risk.")
-            send_discord_message(f"❌ Error: Could not find current leverage for {symbol}.")
-            return None
+        current_leverage = 1.0 # Default to 1x if no position found or no leverage set yet
+        try:
+            position_risk = binance_futures_client.get_position_risk(symbol=symbol)
+            # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
+            found_leverage = False
+            for entry in position_risk:
+                if entry['symbol'] == symbol:
+                    current_leverage = float(entry['leverage'])
+                    found_leverage = True
+                    break
+            if not found_leverage: # If symbol not found in position_risk, assume 1x
+                logging.info(f"No active position found for {symbol}. Assuming current leverage is 1x.")
+        except BinanceAPIException as e:
+            # Handle cases where get_position_risk might fail for other reasons
+            logging.warning(f"Could not get position risk for {symbol}: {e}. Assuming current leverage is 1x.")
+            send_discord_message(f"⚠️ Warning: Could not get position risk for {symbol}: {e}. Assuming 1x leverage.")
+            current_leverage = 1.0 # Fallback to 1x if API call fails
 
         if desired_leverage != current_leverage:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
@@ -222,7 +227,7 @@ def place_order(symbol, side, order_type, quantity, price=None):
         send_discord_message(f"❌ Error placing order for {symbol}: {e}")
         return None
 
-# --- Luồng chính --- 
+# --- Luồng chính ---
 def main():
     logging.info("Main thread started.")
 
@@ -255,7 +260,7 @@ def main():
         send_discord_message(f"🚨 CRITICAL ERROR: Could not fetch exchange info or set leverage: {e}")
         return # Exit if critical setup fails
 
-    # --- Khởi tạo trạng thái giao dịch --- 
+    # --- Khởi tạo trạng thái giao dịch ---
     capital = INITIAL_CAPITAL # This will be updated by actual PnL from Binance
     positions = {symbol: {
         'position': 0, 
