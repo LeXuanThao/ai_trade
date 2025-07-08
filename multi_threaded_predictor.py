@@ -1,5 +1,3 @@
-
-
 import threading
 import time
 import queue
@@ -16,7 +14,7 @@ import os # For environment variables
 # --- Cấu hình Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
-# --- Cấu hình ---
+# --- Cấu hình --- 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 PREDICTION_INTERVAL_SECONDS = 60 # Tần suất dự đoán cho mỗi cặp (ví dụ: mỗi phút)
 
@@ -152,18 +150,27 @@ class ThreadPoolManager:
 # --- Hàm tính toán và đặt đòn bẩy (MỚI) ---
 def calculate_and_set_leverage(symbol, binance_futures_client):
     try:
-        # 1. Get max allowed leverage for the symbol
+        # 1. Get max allowed leverage for the symbol from exchange_info
         # This info is already stored in symbol_info during initial exchange_info fetch
         max_allowed_leverage = symbol_info[symbol]['max_leverage_allowed']
         
         # 2. Determine desired leverage (cap it at MAX_LEVERAGE_CAP)
         desired_leverage = int(min(max_allowed_leverage, MAX_LEVERAGE_CAP))
 
-        # 3. Get current leverage setting
-        # This requires fetching position risk or account info
-        # get_position_risk() is better as it's per symbol
+        # 3. Get current leverage setting for the symbol
+        # Use get_position_risk for current leverage per symbol
         position_risk = binance_futures_client.get_position_risk(symbol=symbol)
-        current_leverage = float(position_risk[0]['leverage']) # Assuming only one position for the symbol
+        # Find the correct entry for the symbol (there might be multiple if you have open orders/positions)
+        current_leverage = None
+        for entry in position_risk:
+            if entry['symbol'] == symbol:
+                current_leverage = float(entry['leverage'])
+                break
+        
+        if current_leverage is None: # Should not happen if symbol is valid
+            logging.error(f"Could not find current leverage for {symbol} in position risk.")
+            send_discord_message(f"❌ Error: Could not find current leverage for {symbol}.")
+            return None
 
         if desired_leverage != current_leverage:
             binance_futures_client.set_leverage(symbol=symbol, leverage=desired_leverage)
@@ -192,7 +199,8 @@ def place_order(symbol, side, order_type, quantity, price=None):
         step_size = symbol_info[symbol]['step_size']
 
         # Round quantity to step_size and ensure it's at least min_qty
-        quantity = max(min_qty, round(quantity / step_size) * step_size)
+        # Use max(min_qty, ...) to ensure it meets minimum quantity requirement
+        quantity = max(min_qty, float(round(quantity / step_size) * step_size))
         
         if quantity == 0: # After rounding, quantity might become 0 if too small
             logging.warning(f"Calculated quantity for {symbol} is zero after rounding. Skipping order.")
@@ -227,13 +235,11 @@ def main():
                 symbol_info[s['symbol']] = {
                     'min_qty': float(s['filters'][1]['minQty']),
                     'step_size': float(s['filters'][1]['stepSize']),
-                    'max_leverage_allowed': float(s['leverageFilter']['maxLeverage'])
+                    'max_leverage_allowed': float(s['filters'][0]['maxLeverage']) # Corrected access to maxLeverage
                 }
                 # Calculate and set leverage for each symbol
-                calculated_leverage = calculate_and_set_leverage(s['symbol'], binance_futures_client)
-                if calculated_leverage is None:
-                    return # Exit if leverage setting fails
-                symbol_info[s['symbol']]['current_set_leverage'] = calculated_leverage # Store the set leverage
+                # This part is removed from startup and moved to entry logic
+                symbol_info[s['symbol']]['current_set_leverage'] = 0 # Initialize to 0 or None
     except Exception as e:
         logging.error(f"Error fetching exchange info or setting leverage: {e}")
         send_discord_message(f"🚨 CRITICAL ERROR: Could not fetch exchange info or set leverage: {e}")
@@ -301,9 +307,16 @@ def main():
                     current_account_balance = capital # Using simulated capital for now
                     max_margin_amount = FIXED_MARGIN_PER_TRADE_USD # Use fixed $1 margin
                     
-                    # Use the leverage that was actually set for this symbol
-                    current_set_leverage = symbol_info[symbol]['current_set_leverage']
-                    notional_value_allowed = max_margin_amount * current_set_leverage
+                    # NEW: Calculate and set leverage before placing order
+                    calculated_leverage = calculate_and_set_leverage(symbol, binance_futures_client)
+                    if calculated_leverage is None: # If setting leverage failed, skip trade
+                        logging.warning(f"Skipping trade for {symbol} due to leverage setting failure.")
+                        continue
+                    symbol_info[symbol]['current_set_leverage'] = calculated_leverage # Store the set leverage
+
+                    notional_value_allowed = max_margin_amount * calculated_leverage
+
+                    notional_value_allowed = max_margin_amount * calculated_leverage
 
                     # Calculate quantity to buy
                     quantity_to_buy = notional_value_allowed / current_price
